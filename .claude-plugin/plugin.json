@@ -1,0 +1,9 @@
+{
+  "name": "team",
+  "version": "1.0.0",
+  "description": "한 저장소를 관리자와 개발자와 리뷰어 세 세션이 나눠 맡게 만든다. 역할마다 git worktree 폴더와 개발 서버 포트를 나누고, 세션 사이의 인계를 파일 인박스로 주고받는다.",
+  "author": {
+    "name": "anminhyeong",
+    "email": "anmh1221@gmail.com"
+  }
+}
