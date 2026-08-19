@@ -11,6 +11,7 @@ usage() {
   cat <<'EOF'
 사용법은 다음과 같습니다.
 
+  team.sh init                      저장소를 훑어 .claude/team.json 초안을 만듭니다.
   team.sh setup                     역할마다 쓸 작업 폴더를 만들고 준비 상태를 보고합니다.
   team.sh status                    세 폴더의 브랜치와 의존성과 포트와 열린 PR 을 보고합니다.
   team.sh brief <역할>              그 역할이 쓸 폴더와 포트와 명령을 설정에서 뽑아 보여 줍니다.
@@ -23,6 +24,11 @@ usage() {
 
 역할은 manager, developer, reviewer 중 하나입니다.
 EOF
+}
+
+in_repo() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "여기는 git 저장소가 아닙니다. 세 세션이 나눠 맡을 저장소 폴더 안에서 부르십시오."
 }
 
 common_dir() { (cd "$(git rev-parse --git-common-dir)" && pwd); }
@@ -271,6 +277,132 @@ cmd_note() {
   printf '  git -C %s branch -D %s\n' "$d" "$branch"
 }
 
+# 저장소를 훑어 설정 파일의 초안을 만든다.
+to_json_array() { jq -R . | jq -s .; }
+
+detect_pm() {
+  local root="$1"
+  if [ -f "$root/pnpm-lock.yaml" ]; then printf 'pnpm\n'
+  elif [ -f "$root/yarn.lock" ]; then printf 'yarn\n'
+  elif [ -f "$root/package-lock.json" ]; then printf 'npm\n'
+  fi
+}
+
+has_script() {
+  [ -f "$1/package.json" ] || return 1
+  jq -e --arg s "$2" '.scripts | has($s)' "$1/package.json" >/dev/null 2>&1
+}
+
+free_port() {
+  local p="$1"
+  while command -v ss >/dev/null && ss -ltn 2>/dev/null | grep -q ":$p[[:space:]]"; do
+    p=$((p + 1))
+  done
+  printf '%s\n' "$p"
+}
+
+cmd_init() {
+  local root cfgpath name base pm install dev run
+  root="$(main_root)"
+  cfgpath="$(config_path)"
+  if [ -f "$cfgpath" ] && [ "${1:-}" != "--force" ]; then
+    die "설정 파일이 이미 있습니다: $cfgpath. 다시 만들려면 --force 를 주십시오."
+  fi
+  name="$(basename "$root")"
+  base="$(git -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'main\n')"
+  [ "$base" = HEAD ] && base=main
+  pm="$(detect_pm "$root")"
+  case "$pm" in
+    pnpm) install="pnpm install"; run="pnpm" ;;
+    yarn) install="yarn install"; run="yarn" ;;
+    npm)  install="npm install";  run="npm run" ;;
+    *)    install="여기에 의존성을 설치하는 명령을 적으십시오"; run="" ;;
+  esac
+  if [ -n "$run" ] && has_script "$root" dev; then
+    if [ "$pm" = npm ]; then
+      dev="npm run dev -- --port {port} --strictPort"
+    else
+      dev="$pm dev --port {port} --strictPort"
+    fi
+  else
+    dev="여기에 개발 서버를 띄우는 명령을 적고 {port} 자리는 남겨 두십시오"
+  fi
+
+  local checks="" c
+  for c in typecheck lint test; do
+    if [ -n "$run" ] && has_script "$root" "$c"; then
+      checks="$checks$run $c\n"
+    fi
+  done
+  [ -n "$checks" ] || checks="여기에 고친 뒤 돌릴 검사 명령을 적으십시오\n"
+
+  local docs="" f
+  for f in README.md CLAUDE.md AGENTS.md context.md; do
+    [ -f "$root/$f" ] && docs="$docs$f\n"
+  done
+  for f in "$root"/docs/*spec*.md "$root"/docs/*.md; do
+    [ -f "$f" ] || continue
+    case "$docs" in *"docs/$(basename "$f")"*) continue ;; esac
+    docs="$docs""docs/$(basename "$f")\n"
+    break
+  done
+  [ -n "$docs" ] || docs="README.md\n"
+
+  local m_owns="" m_avoid="" d_owns="" d_avoid=""
+  for f in context.md README.md docs/; do
+    [ -e "$root/$f" ] && m_owns="$m_owns$f\n"
+  done
+  m_owns="$m_owns""GitHub 이슈와 PR 병합\n"
+  for f in src/ scripts/ lib/ app/; do
+    [ -d "$root/$f" ] && { m_avoid="$m_avoid$f\n"; d_owns="$d_owns$f\n"; }
+  done
+  [ -n "$m_avoid" ] || { m_avoid="src/\n"; d_owns="src/\n"; }
+  d_owns="$d_owns""설정 파일\n"
+  for f in context.md README.md; do
+    [ -e "$root/$f" ] && d_avoid="$d_avoid$f\n"
+  done
+  [ -n "$d_avoid" ] || d_avoid="README.md\n"
+
+  local p1 p2 p3
+  p1="$(free_port 3010)"; p2="$(free_port $((p1 + 1)))"; p3="$(free_port $((p2 + 1)))"
+
+  mkdir -p "$(dirname "$cfgpath")"
+  jq -n \
+    --arg base "$base" \
+    --arg install "$install" \
+    --arg dev "$dev" \
+    --arg work "../$name-work" \
+    --arg review "../$name-review" \
+    --argjson checks "$(printf "$checks" | to_json_array)" \
+    --argjson docs "$(printf "$docs" | to_json_array)" \
+    --argjson mowns "$(printf "$m_owns" | to_json_array)" \
+    --argjson mavoid "$(printf "$m_avoid" | to_json_array)" \
+    --argjson downs "$(printf "$d_owns" | to_json_array)" \
+    --argjson davoid "$(printf "$d_avoid" | to_json_array)" \
+    --argjson p1 "$p1" --argjson p2 "$p2" --argjson p3 "$p3" \
+    '{
+      baseBranch: $base,
+      branch: "issue/{n}",
+      install: $install,
+      checks: $checks,
+      devServer: $dev,
+      reviewNote: "docs/reviews/step-{n}.md",
+      docs: $docs,
+      roles: {
+        manager:   {dir: ".",     port: $p1, owns: $mowns, avoid: $mavoid, notes: ""},
+        developer: {dir: $work,   port: $p2, owns: $downs, avoid: $davoid, notes: ""},
+        reviewer:  {dir: $review, port: $p3, owns: ["PR 코멘트", "docs/reviews/"], avoid: ["코드 전부"], notes: ""}
+      }
+    }' > "$cfgpath"
+  printf '%s 에 초안을 만들었습니다. 내용은 다음과 같습니다.\n\n' "$cfgpath"
+  cat "$cfgpath"
+  printf '\n이 초안은 저장소를 훑어 짐작한 것입니다. 다음 넷을 사용자와 함께 확인하고 고치십시오.\n'
+  printf '  기준 브랜치가 %s 로 맞는지 봅니다.\n' "$base"
+  printf '  검사 명령과 개발 서버 명령이 이 저장소의 것과 맞는지 봅니다.\n'
+  printf '  역할별로 고치는 것과 고치지 않는 것이 이 저장소의 구조와 맞는지 봅니다.\n'
+  printf '  notes 는 비어 있습니다. 이 저장소에서만 지킬 것이 있으면 역할마다 적습니다.\n'
+}
+
 cmd_watch() {
   local r="$1" dir f seen=" "
   check_role "$r"
@@ -291,6 +423,8 @@ cmd_watch() {
 [ $# -gt 0 ] || { usage; exit 1; }
 sub="$1"; shift
 case "$sub" in -h|--help|help) usage; exit 0 ;; esac
+in_repo
+case "$sub" in init) cmd_init "$@"; exit 0 ;; esac
 require_config
 case "$sub" in
   setup)  cmd_setup ;;
