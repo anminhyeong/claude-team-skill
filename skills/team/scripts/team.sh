@@ -26,6 +26,15 @@ usage() {
 EOF
 }
 
+# 반드시 있어야 하는 명령을 먼저 확인한다. gh 와 ss 는 없어도 돌아간다.
+require_tools() {
+  local missing="" c
+  for c in git jq; do
+    command -v "$c" >/dev/null 2>&1 || missing="$missing $c"
+  done
+  [ -z "$missing" ] || die "이 스킬은 다음 명령이 있어야 돌아갑니다:$missing. 우분투나 데비안이면 다음을 돌린 뒤 다시 부르십시오. sudo apt install$missing"
+}
+
 in_repo() {
   git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "여기는 git 저장소가 아닙니다. 세 세션이 나눠 맡을 저장소 폴더 안에서 부르십시오."
@@ -90,11 +99,35 @@ port_state() {
   fi
 }
 
+# 창을 프로젝트 폴더가 아니라 그 위쪽에서 열었을 때를 걸러 낸다.
+# 홈 폴더이거나, 자기 안에 독립된 git 저장소를 여럿 담고 있으면 프로젝트가 아니라 담는 폴더로 본다.
+# 서브모듈은 자식의 .git 이 파일이므로 여기 걸리지 않는다.
+looks_like_container() {
+  local root="$1" n=0 d
+  [ "$root" = "$HOME" ] && return 0
+  for d in "$root"/*/; do
+    [ -d "$d.git" ] || continue
+    n=$((n + 1))
+    [ "$n" -ge 2 ] && return 0
+  done
+  return 1
+}
+
+guard_container() {
+  local root="$1" force="$2"
+  looks_like_container "$root" || return 0
+  [ "$force" = "--force" ] && return 0
+  printf '지금 창이 열린 폴더에서 감지된 저장소는 %s 입니다.\n' "$root" >&2
+  printf '이 폴더는 홈 폴더이거나 독립된 git 저장소를 여럿 담고 있어서, 프로젝트 하나가 아니라 여러 프로젝트를 담는 폴더로 보입니다.\n' >&2
+  die "세 세션이 맡을 프로젝트 폴더에서 창을 새로 열어 다시 부르십시오. 이 폴더가 정말 맞으면 --force 를 주십시오."
+}
+
 cmd_setup() {
   local base root r d
+  root="$(main_root)"
+  guard_container "$root" "${1:-}"
   base="$(cfg .baseBranch)"
   [ -n "$base" ] || die "설정에 baseBranch 가 없습니다."
-  root="$(main_root)"
   for r in $ROLES; do
     d="$(role_dir "$r")"
     if [ "$d" = "$root" ]; then
@@ -163,11 +196,21 @@ cmd_status() {
 }
 
 cmd_brief() {
-  local r="$1" p
+  local r="$1" p rdir here
   check_role "$r"
   p="$(config_path)"
+  rdir="$(role_dir "$r")"
+  here="$(pwd -P)"
   printf '역할은 %s 입니다.\n' "$r"
-  printf '작업 폴더는 %s 입니다.\n' "$(role_dir "$r")"
+  printf '작업 폴더는 %s 입니다.\n' "$rdir"
+  case "$here" in
+    "$rdir"|"$rdir"/*) : ;;
+    *)
+      printf '\n창이 열린 폴더가 틀렸습니다. 이 창은 %s 에서 열렸고 이 역할은 %s 에서 일해야 합니다.\n' "$here" "$rdir"
+      printf '이 상태로 일하면 git 명령이 다른 역할의 폴더를 건드려서 폴더를 나눈 뜻이 무너집니다.\n'
+      printf '%s 에서 창을 새로 열어 다시 역할을 맡으십시오.\n\n' "$rdir"
+      ;;
+  esac
   printf '기준 브랜치는 %s 이고 작업 브랜치 이름은 %s 형태로 짓습니다.\n' "$(cfg .baseBranch)" "$(cfg .branch)"
   printf '개발 서버는 %s 로 띄웁니다.\n' "$(cfg .devServer | sed "s/{port}/$(role_port "$r")/")"
   printf '먼저 읽을 문서는 %s 입니다.\n' "$(jq -r '.docs | join(", ")' "$p")"
@@ -308,6 +351,7 @@ cmd_init() {
   if [ -f "$cfgpath" ] && [ "${1:-}" != "--force" ]; then
     die "설정 파일이 이미 있습니다: $cfgpath. 다시 만들려면 --force 를 주십시오."
   fi
+  guard_container "$root" "${1:-}"
   name="$(basename "$root")"
   base="$(git -C "$root" rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'main\n')"
   [ "$base" = HEAD ] && base=main
@@ -423,11 +467,12 @@ cmd_watch() {
 [ $# -gt 0 ] || { usage; exit 1; }
 sub="$1"; shift
 case "$sub" in -h|--help|help) usage; exit 0 ;; esac
+require_tools
 in_repo
 case "$sub" in init) cmd_init "$@"; exit 0 ;; esac
 require_config
 case "$sub" in
-  setup)  cmd_setup ;;
+  setup)  cmd_setup "${1:-}" ;;
   status) cmd_status ;;
   brief)  [ $# -eq 1 ] || die "역할 이름을 하나 주십시오."; cmd_brief "$1" ;;
   send)   cmd_send "$@" ;;
